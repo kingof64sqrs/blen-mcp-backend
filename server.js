@@ -397,6 +397,81 @@ app.post('/api/auth/refresh', async (req, res) => {
   }
 });
 
+/**
+ * PUT /api/auth/profile
+ * Update user profile (requires authentication)
+ * Headers: { Authorization: "Bearer token" }
+ * Body: { firstName?, lastName?, companyName?, phoneNumber? }
+ */
+app.put('/api/auth/profile', async (req, res) => {
+  try {
+    // Get user ID from Bearer token
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ success: false, message: 'Unauthorized: No token provided' });
+    }
+
+    const token = authHeader.substring(7);
+
+    // Verify token and get user ID
+    const jwt = require('jsonwebtoken');
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (error) {
+      return res.status(401).json({ success: false, message: 'Invalid or expired token' });
+    }
+
+    // Find user by ID
+    const user = await User.findById(decoded.userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    // Extract fields to update
+    const { firstName, lastName, companyName, phoneNumber } = req.body;
+
+    // Validate at least one field is provided
+    if (!firstName && !lastName && !companyName && !phoneNumber) {
+      return res.status(400).json({ success: false, message: 'No fields to update' });
+    }
+
+    // Validate required fields if provided
+    if (firstName && !firstName.trim()) {
+      return res.status(400).json({ success: false, message: 'First name cannot be empty' });
+    }
+    if (lastName && !lastName.trim()) {
+      return res.status(400).json({ success: false, message: 'Last name cannot be empty' });
+    }
+
+    // Update fields
+    if (firstName) user.firstName = firstName.trim();
+    if (lastName) user.lastName = lastName.trim();
+    if (companyName) user.companyName = companyName.trim();
+    if (phoneNumber) user.phoneNumber = phoneNumber.trim();
+
+    // Save updated user
+    await user.save();
+
+    return res.json({
+      success: true,
+      message: 'Profile updated successfully',
+      data: {
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        companyName: user.companyName,
+        phoneNumber: user.phoneNumber,
+        verification_status: user.verification_status,
+        updatedAt: user.updatedAt || new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('Profile update error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message });
+  }
+});
+
 // ============= BLENDER ENDPOINTS (UNCHANGED) =============
 
 /**
