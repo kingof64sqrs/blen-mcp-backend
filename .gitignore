@@ -2,5 +2,16 @@ node_modules/
 npm-debug.log
 .DS_Store
 *.log
+.env
 .env.local
-.env.*.local
+.env.*
+*.local
+
+# User uploaded files
+uploads/
+*.svg
+
+# Exported 3D models
+exports/
+*.glb
+*.gltf

@@ -24,6 +24,12 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
+// Create exports directory if it doesn't exist
+const exportsDir = path.join(__dirname, 'exports');
+if (!fs.existsSync(exportsDir)) {
+  fs.mkdirSync(exportsDir, { recursive: true });
+}
+
 // Configure multer for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -51,6 +57,8 @@ app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use('/uploads', express.static(uploadsDir)); // Serve uploaded files
+app.use('/exports', express.static(exportsDir)); // Serve exported GLB files
+app.use('/views', express.static(path.join(__dirname, 'views'))); // Serve HTML views
 
 // Initialize MCP Client
 const mcpClient = new MCPClient();
@@ -388,11 +396,106 @@ app.get('/api/blender/screenshot', ensureConnection, async (req, res) => {
     const maxSize = parseInt(req.query.maxSize) || 800;
     const result = await mcpClient.getViewportScreenshot(maxSize);
     
+    // Extract screenshot from MCP response
+    let screenshotData = null;
+    
+    if (result && result.content && Array.isArray(result.content)) {
+      // MCP returns content as array with type and data
+      const imageContent = result.content.find(item => item.type === 'image');
+      if (imageContent && imageContent.data) {
+        screenshotData = imageContent.data;
+      }
+    }
+    
     res.json({
       success: true,
+      screenshot: screenshotData,
       data: result
     });
   } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * POST /api/blender/export-glb
+ * Export current Blender scene as GLB file
+ * Returns URL to download the exported GLB
+ */
+app.post('/api/blender/export-glb', ensureConnection, async (req, res) => {
+  try {
+    const timestamp = Date.now();
+    const filename = `model-${timestamp}.glb`;
+    const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
+    
+    // Python code to export scene as GLB
+    const exportCode = `
+import bpy
+import os
+
+# Enable GLTF exporter addon if not already enabled
+if 'io_scene_gltf2' not in bpy.context.preferences.addons:
+    try:
+        bpy.ops.preferences.addon_enable(module='io_scene_gltf2')
+        print("GLTF exporter addon enabled")
+    except Exception as e:
+        print(f"Warning: Could not enable GLTF exporter: {str(e)}")
+
+export_path = r"${exportPath}"
+print(f"Exporting to: {export_path}")
+
+# Make sure export directory exists
+os.makedirs(os.path.dirname(export_path), exist_ok=True)
+
+# Convert all materials to use shader nodes for proper export
+for mat in bpy.data.materials:
+    if mat and not mat.use_nodes:
+        print(f"Converting material '{mat.name}' to use nodes")
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        bsdf = nodes.get('Principled BSDF')
+        if bsdf:
+            # Copy viewport color to shader node
+            bsdf.inputs['Base Color'].default_value = mat.diffuse_color
+            print(f"Set Base Color to {mat.diffuse_color[:]}")
+
+# Select all mesh objects
+bpy.ops.object.select_all(action='DESELECT')
+for obj in bpy.data.objects:
+    if obj.type == 'MESH':
+        obj.select_set(True)
+
+if not bpy.context.selected_objects:
+    print("Warning: No mesh objects to export")
+else:
+    # Export selected objects as GLB
+    bpy.ops.export_scene.gltf(
+        filepath=export_path,
+        export_format='GLB',
+        use_selection=True,
+        export_apply=True,
+        export_materials='EXPORT'
+    )
+    print(f"Successfully exported {len(bpy.context.selected_objects)} objects to GLB")
+`;
+
+    await mcpClient.executeBlenderCode(exportCode);
+    
+    // Return URL to access the exported file
+    const fileUrl = `http://localhost:${PORT}/exports/${filename}`;
+    
+    res.json({
+      success: true,
+      message: 'Scene exported successfully',
+      filename: filename,
+      url: fileUrl,
+      path: exportPath
+    });
+  } catch (error) {
+    console.error('GLB export error:', error);
     res.status(500).json({
       success: false,
       error: error.message
@@ -410,6 +513,76 @@ app.get('/api/blender/scene', ensureConnection, async (req, res) => {
     res.json({
       success: true,
       data: result
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * POST /api/blender/test-export
+ * Test export functionality with a simple cube
+ */
+app.post('/api/blender/test-export', ensureConnection, async (req, res) => {
+  try {
+    // Create a simple cube and export it
+    const timestamp = Date.now();
+    const filename = `test-cube-${timestamp}.glb`;
+    const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
+    
+    const testCode = `
+import bpy
+
+# Clear scene
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete()
+
+# Create a cube
+bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0))
+cube = bpy.context.active_object
+cube.name = "TestCube"
+
+print(f"Created cube: {cube.name}")
+
+# Export
+export_path = r"${exportPath}"
+import os
+os.makedirs(os.path.dirname(export_path), exist_ok=True)
+
+bpy.ops.object.select_all(action='DESELECT')
+cube.select_set(True)
+
+try:
+    bpy.ops.export_scene.gltf(
+        filepath=export_path,
+        export_format='GLB',
+        use_selection=True
+    )
+    if os.path.exists(export_path):
+        print(f"SUCCESS: Test export created at {export_path}")
+    else:
+        print(f"ERROR: File not created")
+except Exception as e:
+    print(f"ERROR: {str(e)}")
+`;
+
+    await mcpClient.executeBlenderCode(testCode);
+    
+    const fileExists = fs.existsSync(exportPath);
+    const fileUrl = `http://localhost:${PORT}/exports/${filename}`;
+    
+    res.json({
+      success: true,
+      message: 'Test export completed',
+      export: {
+        filename,
+        url: fileUrl,
+        exists: fileExists,
+        path: exportPath
+      }
     });
   } catch (error) {
     res.status(500).json({
@@ -448,6 +621,20 @@ if 'io_curve_svg' not in bpy.context.preferences.addons:
     except Exception as e:
         print(f"Warning: Could not enable SVG import addon: {str(e)}")
 
+# Enable GLTF exporter addon if not already enabled
+if 'io_scene_gltf2' not in bpy.context.preferences.addons:
+    try:
+        bpy.ops.preferences.addon_enable(module='io_scene_gltf2')
+        print("GLTF exporter addon enabled")
+    except Exception as e:
+        print(f"Warning: Could not enable GLTF exporter: {str(e)}")
+
+# Clear the entire scene first
+print("Clearing scene...")
+bpy.ops.object.select_all(action='SELECT')
+bpy.ops.object.delete()
+print("Scene cleared")
+
 # Clear existing selection
 bpy.ops.object.select_all(action='DESELECT')
 
@@ -477,6 +664,17 @@ except Exception as e:
     raise
 
 if imported_objects:
+    # Store original colors from curve materials before conversion
+    curve_colors = {}
+    for obj in imported_objects:
+        if obj.type == 'CURVE' and obj.data.materials:
+            for mat in obj.data.materials:
+                if mat:
+                    # Store the material color (RGBA)
+                    curve_colors[obj.name] = mat.diffuse_color[:]
+                    print(f"Found color in {obj.name}: {mat.diffuse_color[:]}")
+                    break
+    
     # Convert curves to mesh
     for obj in imported_objects:
         print(f"Processing object: {obj.name}, type: {obj.type}")
@@ -505,6 +703,49 @@ if imported_objects:
         bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
         final_obj.location = (0, 0, 0)
         
+        # Apply the original SVG color to the mesh
+        if curve_colors:
+            # Use the first color found
+            svg_color = list(curve_colors.values())[0]
+            print(f"Applying SVG color: {svg_color}")
+            
+            # Create or update material with proper shader nodes
+            mat_name = "SVG_Material"
+            if mat_name in bpy.data.materials:
+                mat = bpy.data.materials[mat_name]
+            else:
+                mat = bpy.data.materials.new(name=mat_name)
+            
+            # Enable nodes
+            mat.use_nodes = True
+            nodes = mat.node_tree.nodes
+            nodes.clear()
+            
+            # Create Principled BSDF
+            bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
+            bsdf.location = (0, 0)
+            bsdf.inputs['Base Color'].default_value = svg_color
+            bsdf.inputs['Roughness'].default_value = 0.4
+            bsdf.inputs['Metallic'].default_value = 0.3
+            
+            # Create Material Output
+            output = nodes.new(type='ShaderNodeOutputMaterial')
+            output.location = (300, 0)
+            
+            # Link nodes
+            links = mat.node_tree.links
+            links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+            
+            # Apply material to object
+            if final_obj.data.materials:
+                final_obj.data.materials[0] = mat
+            else:
+                final_obj.data.materials.append(mat)
+            
+            print(f"Material '{mat_name}' created and applied with color {svg_color}")
+        else:
+            print("Warning: No color information found in SVG, using default material")
+        
         print(f"SVG imported successfully: {final_obj.name}")
         print(f"Vertices: {len(final_obj.data.vertices)}")
         print(f"Faces: {len(final_obj.data.polygons)}")
@@ -514,6 +755,80 @@ else:
 
     const result = await mcpClient.executeBlenderCode(importCode);
     
+    // Auto-export as GLB with better error handling
+    const timestamp = Date.now();
+    const filename = `svg-import-${timestamp}.glb`;
+    const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
+    
+    const exportCode = `
+import bpy
+import os
+
+export_path = r"${exportPath}"
+print(f"Export path: {export_path}")
+
+# Ensure directory exists
+export_dir = os.path.dirname(export_path)
+os.makedirs(export_dir, exist_ok=True)
+print(f"Export directory: {export_dir}")
+
+# Convert all materials to use shader nodes for proper export
+for mat in bpy.data.materials:
+    if mat and not mat.use_nodes:
+        print(f"Converting material '{mat.name}' to use nodes")
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        bsdf = nodes.get('Principled BSDF')
+        if bsdf:
+            # Copy viewport color to shader node
+            bsdf.inputs['Base Color'].default_value = mat.diffuse_color
+            print(f"Set Base Color to {mat.diffuse_color[:]}")
+
+# Select all mesh objects
+bpy.ops.object.select_all(action='DESELECT')
+mesh_count = 0
+for obj in bpy.data.objects:
+    if obj.type == 'MESH':
+        obj.select_set(True)
+        mesh_count += 1
+        print(f"Selected mesh: {obj.name}")
+
+print(f"Total meshes selected: {mesh_count}")
+
+if mesh_count == 0:
+    print("ERROR: No mesh objects found to export!")
+else:
+    try:
+        # Export as GLB
+        bpy.ops.export_scene.gltf(
+            filepath=export_path,
+            export_format='GLB',
+            use_selection=True,
+            export_apply=True,
+            export_materials='EXPORT'
+        )
+        
+        # Verify file was created
+        if os.path.exists(export_path):
+            file_size = os.path.getsize(export_path)
+            print(f"SUCCESS: Exported {mesh_count} objects to {export_path} (size: {file_size} bytes)")
+        else:
+            print(f"ERROR: Export completed but file not found at {export_path}")
+    except Exception as e:
+        print(f"ERROR during export: {str(e)}")
+        import traceback
+        traceback.print_exc()
+`;
+
+    const exportResult = await mcpClient.executeBlenderCode(exportCode);
+    console.log('Export result:', exportResult);
+    
+    // Check if file actually exists
+    const fileExists = fs.existsSync(exportPath);
+    console.log('File exists:', fileExists, 'at', exportPath);
+    
+    const fileUrl = `http://localhost:${PORT}/exports/${filename}`;
+    
     res.json({
       success: true,
       message: 'SVG imported into Blender successfully',
@@ -522,7 +837,14 @@ else:
         path: svgPath,
         size: req.file.size
       },
-      result: result
+      result: result,
+      export: {
+        filename: filename,
+        url: fileUrl,
+        exists: fileExists,
+        path: exportPath
+      },
+      exportResult: exportResult
     });
   } catch (error) {
     console.error('SVG import error:', error);
@@ -650,10 +972,11 @@ app.post('/api/prompt', ensureConnection, async (req, res) => {
 Rules:
 - Only output Python code, no explanations
 - Always import bpy at the start
-- Use proper Blender API syntax
+- Use proper Blender API syntax with shader nodes for materials
 - Handle common operations: creating objects, materials, animations, modifiers
 - For positions, use location parameter in tuples
-- For colors, use RGBA values (0-1 range)
+- For colors, ALWAYS use shader nodes (Principled BSDF) with RGBA values (0-1 range)
+- NEVER use diffuse_color alone - always set up proper shader nodes
 - Add print statements to confirm actions
 
 Examples:
@@ -662,9 +985,30 @@ Code: import bpy
 bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0))
 obj = bpy.context.active_object
 mat = bpy.data.materials.new(name='Red')
-mat.diffuse_color = (1, 0, 0, 1)
+mat.use_nodes = True
+nodes = mat.node_tree.nodes
+bsdf = nodes.get('Principled BSDF')
+if bsdf:
+    bsdf.inputs['Base Color'].default_value = (1, 0, 0, 1)
 obj.data.materials.append(mat)
 print('Red cube created')
+
+User: "change color to blue"
+Code: import bpy
+obj = bpy.context.active_object
+if obj and obj.type == 'MESH':
+    if not obj.data.materials:
+        mat = bpy.data.materials.new(name='Blue')
+        mat.use_nodes = True
+        obj.data.materials.append(mat)
+    else:
+        mat = obj.data.materials[0]
+        mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    bsdf = nodes.get('Principled BSDF')
+    if bsdf:
+        bsdf.inputs['Base Color'].default_value = (0, 0, 1, 1)
+    print('Changed color to blue')
 
 User: "add a light above"
 Code: import bpy
@@ -694,11 +1038,83 @@ print('Light added')`;
     // Execute the generated code in Blender
     const result = await mcpClient.executeBlenderCode(generatedCode);
     
+    // Auto-export as GLB with better error handling
+    const timestamp = Date.now();
+    const filename = `model-${timestamp}.glb`;
+    const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
+    
+    const exportCode = `
+import bpy
+import os
+
+# Enable GLTF exporter addon if not already enabled
+if 'io_scene_gltf2' not in bpy.context.preferences.addons:
+    try:
+        bpy.ops.preferences.addon_enable(module='io_scene_gltf2')
+        print("GLTF exporter addon enabled")
+    except Exception as e:
+        print(f"Warning: Could not enable GLTF exporter: {str(e)}")
+
+export_path = r"${exportPath}"
+print(f"Export path: {export_path}")
+
+# Ensure directory exists
+export_dir = os.path.dirname(export_path)
+os.makedirs(export_dir, exist_ok=True)
+
+# Convert all materials to use shader nodes for proper export
+for mat in bpy.data.materials:
+    if mat and not mat.use_nodes:
+        print(f"Converting material '{mat.name}' to use nodes")
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        bsdf = nodes.get('Principled BSDF')
+        if bsdf:
+            # Copy viewport color to shader node
+            bsdf.inputs['Base Color'].default_value = mat.diffuse_color
+            print(f"Set Base Color to {mat.diffuse_color[:]}")
+
+# Select all mesh objects
+bpy.ops.object.select_all(action='DESELECT')
+mesh_count = 0
+for obj in bpy.data.objects:
+    if obj.type == 'MESH':
+        obj.select_set(True)
+        mesh_count += 1
+
+print(f"Total meshes selected: {mesh_count}")
+
+if mesh_count > 0:
+    try:
+        bpy.ops.export_scene.gltf(
+            filepath=export_path,
+            export_format='GLB',
+            use_selection=True,
+            export_apply=True,
+            export_materials='EXPORT'
+        )
+        if os.path.exists(export_path):
+            print(f"SUCCESS: Exported {mesh_count} objects ({os.path.getsize(export_path)} bytes)")
+        else:
+            print(f"ERROR: Export completed but file not found")
+    except Exception as e:
+        print(f"ERROR during export: {str(e)}")
+`;
+
+    const exportResult = await mcpClient.executeBlenderCode(exportCode);
+    const fileExists = fs.existsSync(exportPath);
+    const fileUrl = `http://localhost:${PORT}/exports/${filename}`;
+    
     res.json({
       success: true,
       prompt: prompt,
       generatedCode: generatedCode,
-      result: result
+      result: result,
+      export: {
+        filename: filename,
+        url: fileUrl,
+        exists: fileExists
+      }
     });
   } catch (error) {
     console.error('Prompt execution error:', error.message);
@@ -762,6 +1178,76 @@ app.post('/api/tool/call', ensureConnection, async (req, res) => {
     res.json({
       success: true,
       data: result
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ============= EMBED ENDPOINTS =============
+
+/**
+ * GET /embed/viewer
+ * Standalone embeddable viewer page
+ * Query params: url (model URL) or modelId (model filename)
+ * Optional: bg (background color), autoRotate (true/false), controls (true/false)
+ */
+app.get('/embed/viewer', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'embed.html'));
+});
+
+/**
+ * GET /api/embed/code/:modelId
+ * Generate embed code for a model
+ */
+app.get('/api/embed/code/:modelId', (req, res) => {
+  try {
+    const { modelId } = req.params;
+    const { width = '800', height = '600', autoRotate = 'false', controls = 'true', bg = '#1a1a1a' } = req.query;
+    
+    const baseUrl = `http://localhost:${PORT}`;
+    const embedUrl = `${baseUrl}/embed/viewer?modelId=${modelId}&autoRotate=${autoRotate}&controls=${controls}&bg=${encodeURIComponent(bg)}`;
+    
+    const iframeCode = `<iframe 
+  src="${embedUrl}" 
+  width="${width}" 
+  height="${height}" 
+  frameborder="0" 
+  allowfullscreen
+></iframe>`;
+
+    const htmlCode = `<!DOCTYPE html>
+<html>
+<head>
+    <title>3D Model Viewer</title>
+</head>
+<body>
+    ${iframeCode}
+</body>
+</html>`;
+
+    const directLinkCode = `<a href="${embedUrl}" target="_blank">View 3D Model</a>`;
+
+    res.json({
+      success: true,
+      modelId,
+      embedUrl,
+      codes: {
+        iframe: iframeCode,
+        html: htmlCode,
+        directLink: directLinkCode,
+        markdown: `[View 3D Model](${embedUrl})`
+      },
+      customization: {
+        width: 'Iframe width (default: 800px)',
+        height: 'Iframe height (default: 600px)',
+        autoRotate: 'Auto-rotate model (true/false, default: false)',
+        controls: 'Show controls help (true/false, default: true)',
+        bg: 'Background color (hex, default: #1a1a1a)'
+      }
     });
   } catch (error) {
     res.status(500).json({
