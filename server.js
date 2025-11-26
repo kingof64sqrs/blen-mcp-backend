@@ -41,7 +41,7 @@ const storage = multer.diskStorage({
   }
 });
 
-const upload = multer({ 
+const upload = multer({
   storage,
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'image/svg+xml' || file.originalname.endsWith('.svg')) {
@@ -120,9 +120,20 @@ app.post('/api/auth/check-user', async (req, res) => {
     }
 
     const user = await User.findOne({ email: email.toLowerCase() });
-    
+
     if (user) {
-      return res.json({ exists: true, user: { email: user.email, firstName: user.firstName } });
+      return res.json({
+        exists: true,
+        verified: user.verification_status === 'VERIFIED',
+        user: {
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          companyName: user.companyName,
+          phoneNumber: user.phoneNumber,
+          verification_status: user.verification_status
+        }
+      });
     } else {
       return res.json({ exists: false });
     }
@@ -160,13 +171,36 @@ app.post('/api/auth/register', async (req, res) => {
 
     await user.save();
 
+    // Automatically send OTP for registration
+    try {
+      // Generate 6-digit OTP
+      const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+      // Delete any existing OTPs for this email
+      await OTP.deleteMany({ email: email.toLowerCase() });
+
+      // Save new OTP
+      const otpDoc = new OTP({
+        email: email.toLowerCase(),
+        otp
+      });
+      await otpDoc.save();
+
+      // Send email
+      await sendOTPEmail(email, otp, firstName);
+    } catch (emailError) {
+      console.error('Error sending OTP email:', emailError);
+      // Don't fail the registration if email fails, just log it
+    }
+
     return res.status(201).json({
       success: true,
-      message: 'User registered successfully',
+      message: 'User registered successfully. OTP sent to your email.',
       user: {
         email: user.email,
         firstName: user.firstName,
-        lastName: user.lastName
+        lastName: user.lastName,
+        verification_status: user.verification_status
       }
     });
   } catch (error) {
@@ -255,6 +289,11 @@ app.post('/api/auth/verify-otp', async (req, res) => {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
+    // Update user verification status
+    user.verification_status = 'VERIFIED';
+    user.verified_at = new Date();
+    await user.save();
+
     // Generate tokens
     const accessToken = generateAccessToken(user._id);
     const refreshToken = generateRefreshToken(user._id);
@@ -272,12 +311,17 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     return res.json({
       success: true,
       message: 'Login successful',
-      accessToken,
-      refreshToken,
-      user: {
-        email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName
+      data: {
+        accessToken,
+        refreshToken,
+        user: {
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          companyName: user.companyName,
+          phoneNumber: user.phoneNumber,
+          verification_status: user.verification_status
+        }
       }
     });
   } catch (error) {
@@ -302,6 +346,53 @@ app.post('/api/auth/logout', async (req, res) => {
     return res.json({ success: true, message: 'Logged out successfully' });
   } catch (error) {
     console.error('Logout error:', error);
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message });
+  }
+});
+
+/**
+ * POST /api/auth/refresh
+ * Refresh access token using refresh token
+ * Body: { refreshToken: "token" }
+ */
+app.post('/api/auth/refresh', async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+
+    if (!refreshToken) {
+      return res.status(400).json({ success: false, message: 'Refresh token is required' });
+    }
+
+    // Find token in database
+    const tokenDoc = await Token.findOne({ refreshToken });
+    if (!tokenDoc) {
+      return res.status(401).json({ success: false, message: 'Invalid or expired refresh token' });
+    }
+
+    // Get user
+    const user = await User.findById(tokenDoc.userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    // Generate new access token
+    const newAccessToken = generateAccessToken(user._id);
+
+    return res.json({
+      success: true,
+      data: {
+        accessToken: newAccessToken,
+        refreshToken: refreshToken,
+        user: {
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          verification_status: user.verification_status
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Token refresh error:', error);
     return res.status(500).json({ success: false, message: 'Server error', error: error.message });
   }
 });
@@ -365,7 +456,7 @@ app.get('/api/status', ensureConnection, async (req, res) => {
 app.post('/api/blender/execute', ensureConnection, async (req, res) => {
   try {
     const { code } = req.body;
-    
+
     if (!code) {
       return res.status(400).json({
         success: false,
@@ -395,10 +486,10 @@ app.get('/api/blender/screenshot', ensureConnection, async (req, res) => {
   try {
     const maxSize = parseInt(req.query.maxSize) || 800;
     const result = await mcpClient.getViewportScreenshot(maxSize);
-    
+
     // Extract screenshot from MCP response
     let screenshotData = null;
-    
+
     if (result && result.content && Array.isArray(result.content)) {
       // MCP returns content as array with type and data
       const imageContent = result.content.find(item => item.type === 'image');
@@ -406,7 +497,7 @@ app.get('/api/blender/screenshot', ensureConnection, async (req, res) => {
         screenshotData = imageContent.data;
       }
     }
-    
+
     res.json({
       success: true,
       screenshot: screenshotData,
@@ -430,7 +521,7 @@ app.post('/api/blender/export-glb', ensureConnection, async (req, res) => {
     const timestamp = Date.now();
     const filename = `model-${timestamp}.glb`;
     const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
-    
+
     // Python code to export scene as GLB
     const exportCode = `
 import bpy
@@ -483,10 +574,10 @@ else:
 `;
 
     await mcpClient.executeBlenderCode(exportCode);
-    
+
     // Return URL to access the exported file
     const fileUrl = `http://localhost:${PORT}/exports/${filename}`;
-    
+
     res.json({
       success: true,
       message: 'Scene exported successfully',
@@ -532,7 +623,7 @@ app.post('/api/blender/test-export', ensureConnection, async (req, res) => {
     const timestamp = Date.now();
     const filename = `test-cube-${timestamp}.glb`;
     const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
-    
+
     const testCode = `
 import bpy
 
@@ -570,10 +661,10 @@ except Exception as e:
 `;
 
     await mcpClient.executeBlenderCode(testCode);
-    
+
     const fileExists = fs.existsSync(exportPath);
     const fileUrl = `http://localhost:${PORT}/exports/${filename}`;
-    
+
     res.json({
       success: true,
       message: 'Test export completed',
@@ -607,7 +698,7 @@ app.post('/api/blender/import-svg', upload.single('file'), ensureConnection, asy
     }
 
     const svgPath = req.file.path.replace(/\\/g, '/'); // Normalize path for Blender
-    
+
     // Python code to import SVG in Blender
     const importCode = `
 import bpy
@@ -754,12 +845,12 @@ else:
 `;
 
     const result = await mcpClient.executeBlenderCode(importCode);
-    
+
     // Auto-export as GLB with better error handling
     const timestamp = Date.now();
     const filename = `svg-import-${timestamp}.glb`;
     const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
-    
+
     const exportCode = `
 import bpy
 import os
@@ -822,13 +913,13 @@ else:
 
     const exportResult = await mcpClient.executeBlenderCode(exportCode);
     console.log('Export result:', exportResult);
-    
+
     // Check if file actually exists
     const fileExists = fs.existsSync(exportPath);
     console.log('File exists:', fileExists, 'at', exportPath);
-    
+
     const fileUrl = `http://localhost:${PORT}/exports/${filename}`;
-    
+
     res.json({
       success: true,
       message: 'SVG imported into Blender successfully',
@@ -863,7 +954,7 @@ else:
 app.post('/api/blender/texture', ensureConnection, async (req, res) => {
   try {
     const { objectName, textureId } = req.body;
-    
+
     if (!objectName || !textureId) {
       return res.status(400).json({
         success: false,
@@ -894,7 +985,7 @@ app.post('/api/blender/texture', ensureConnection, async (req, res) => {
 app.get('/api/sketchfab/search', ensureConnection, async (req, res) => {
   try {
     const { query, count, categories, downloadable } = req.query;
-    
+
     if (!query) {
       return res.status(400).json({
         success: false,
@@ -928,7 +1019,7 @@ app.get('/api/sketchfab/search', ensureConnection, async (req, res) => {
 app.post('/api/sketchfab/download', ensureConnection, async (req, res) => {
   try {
     const { uid } = req.body;
-    
+
     if (!uid) {
       return res.status(400).json({
         success: false,
@@ -959,7 +1050,7 @@ app.post('/api/sketchfab/download', ensureConnection, async (req, res) => {
 app.post('/api/prompt', ensureConnection, async (req, res) => {
   try {
     const { prompt } = req.body;
-    
+
     if (!prompt) {
       return res.status(400).json({
         success: false,
@@ -1034,15 +1125,15 @@ print('Light added')`;
     );
 
     const generatedCode = response.data.choices[0].message.content.trim();
-    
+
     // Execute the generated code in Blender
     const result = await mcpClient.executeBlenderCode(generatedCode);
-    
+
     // Auto-export as GLB with better error handling
     const timestamp = Date.now();
     const filename = `model-${timestamp}.glb`;
     const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
-    
+
     const exportCode = `
 import bpy
 import os
@@ -1104,7 +1195,7 @@ if mesh_count > 0:
     const exportResult = await mcpClient.executeBlenderCode(exportCode);
     const fileExists = fs.existsSync(exportPath);
     const fileUrl = `http://localhost:${PORT}/exports/${filename}`;
-    
+
     res.json({
       success: true,
       prompt: prompt,
@@ -1135,7 +1226,7 @@ if mesh_count > 0:
 app.post('/api/generate/hyper3d', ensureConnection, async (req, res) => {
   try {
     const { textPrompt, bboxCondition } = req.body;
-    
+
     if (!textPrompt) {
       return res.status(400).json({
         success: false,
@@ -1166,7 +1257,7 @@ app.post('/api/generate/hyper3d', ensureConnection, async (req, res) => {
 app.post('/api/tool/call', ensureConnection, async (req, res) => {
   try {
     const { toolName, args } = req.body;
-    
+
     if (!toolName) {
       return res.status(400).json({
         success: false,
@@ -1207,10 +1298,10 @@ app.get('/api/embed/code/:modelId', (req, res) => {
   try {
     const { modelId } = req.params;
     const { width = '800', height = '600', autoRotate = 'false', controls = 'true', bg = '#1a1a1a' } = req.query;
-    
+
     const baseUrl = `http://localhost:${PORT}`;
     const embedUrl = `${baseUrl}/embed/viewer?modelId=${modelId}&autoRotate=${autoRotate}&controls=${controls}&bg=${encodeURIComponent(bg)}`;
-    
+
     const iframeCode = `<iframe 
   src="${embedUrl}" 
   width="${width}" 

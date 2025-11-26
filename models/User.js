@@ -24,7 +24,23 @@ const userSchema = new mongoose.Schema({
   },
   phoneNumber: {
     type: String,
-    trim: true
+    trim: true,
+    validate: {
+      validator: function (v) {
+        if (!v) return true; // Phone is optional
+        return /^\d{10}$/.test(v.replace(/\D/g, ''));
+      },
+      message: 'Phone number must be 10 digits'
+    }
+  },
+  verification_status: {
+    type: String,
+    enum: ['PENDING', 'VERIFIED'],
+    default: 'PENDING'
+  },
+  verified_at: {
+    type: Date,
+    default: null
   },
   createdAt: {
     type: Date,
