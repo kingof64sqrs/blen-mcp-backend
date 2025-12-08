@@ -99,7 +99,103 @@ print("=" * 60)
 }
 
 /**
- * Generate PBR material enhancement code
+ * Generate PBR material enhancement code (preserves existing colors)
+ */
+function generatePBRMaterialEnhancementPreserveColors() {
+  return `
+import bpy
+
+print("\\n" + "=" * 60)
+print("PBR MATERIAL ENHANCEMENT (PRESERVING COLORS)")
+print("=" * 60)
+
+enhanced_count = 0
+
+for obj in bpy.data.objects:
+    if obj.type != 'MESH':
+        continue
+    
+    print(f"\\nProcessing: {obj.name}")
+    
+    # Ensure object has materials
+    if not obj.data.materials:
+        print("  Creating default material...")
+        mat = bpy.data.materials.new(name=f"{obj.name}_Material")
+        mat.use_nodes = True
+        obj.data.materials.append(mat)
+    
+    # Process each material
+    for i, mat in enumerate(obj.data.materials):
+        if not mat:
+            continue
+        
+        print(f"  Material {i + 1}: {mat.name}")
+        
+        # Enable nodes if not already
+        if not mat.use_nodes:
+            mat.use_nodes = True
+            print("    ✓ Enabled shader nodes")
+        
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        
+        # Find or create Principled BSDF
+        bsdf = nodes.get('Principled BSDF')
+        if not bsdf:
+            bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
+            print("    ✓ Added Principled BSDF")
+        
+        # Store current color BEFORE making changes
+        current_color = bsdf.inputs['Base Color'].default_value[:]
+        
+        # Find or create Material Output
+        output = None
+        for node in nodes:
+            if node.type == 'OUTPUT_MATERIAL':
+                output = node
+                break
+        
+        if not output:
+            output = nodes.new(type='ShaderNodeOutputMaterial')
+            print("    ✓ Added Material Output")
+        
+        # Link BSDF to Output
+        if not output.inputs['Surface'].is_linked:
+            links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+            print("    ✓ Linked BSDF to output")
+        
+        # Restore original color (preserve user/SVG colors)
+        bsdf.inputs['Base Color'].default_value = current_color
+        
+        # Ensure reasonable PBR values (but don't touch color)
+        current_roughness = bsdf.inputs['Roughness'].default_value
+        if current_roughness < 0.1 or current_roughness > 0.95:
+            bsdf.inputs['Roughness'].default_value = 0.4
+            print("    ✓ Adjusted roughness to 0.4")
+        
+        current_metallic = bsdf.inputs['Metallic'].default_value
+        if current_metallic > 0.5:
+            bsdf.inputs['Metallic'].default_value = 1.0
+            print("    ✓ Set metallic to 1.0")
+        else:
+            bsdf.inputs['Metallic'].default_value = 0.0
+        
+        # Set specular
+        if 'Specular IOR Level' in bsdf.inputs:
+            bsdf.inputs['Specular IOR Level'].default_value = 0.5
+        elif 'Specular' in bsdf.inputs:
+            bsdf.inputs['Specular'].default_value = 0.5
+        
+        print(f"    ✓ Color preserved: RGB{tuple(round(c, 3) for c in current_color[:3])}")
+        enhanced_count += 1
+
+print(f"\\n✓ Enhanced {enhanced_count} materials (colors preserved)")
+print("=" * 60)
+`;
+}
+
+/**
+ * Generate PBR material enhancement code (original - may override colors)
  */
 function generatePBRMaterialEnhancement() {
   return `
@@ -286,6 +382,53 @@ else:
         obj.select_set(False)
     
     print(f"\\n✓ Processed {len(mesh_objects)} object(s)")
+
+print("=" * 60)
+`;
+}
+
+/**
+ * Generate origin fix only (preserves user-set scales/sizes)
+ */
+function generateOriginFixPreserveScale() {
+  return `
+import bpy
+
+print("\\n" + "=" * 60)
+print("ORIGIN FIX (PRESERVING CUSTOM SCALES)")
+print("=" * 60)
+
+# Process all mesh objects - only fix origins, preserve sizes
+mesh_objects = [obj for obj in bpy.data.objects if obj.type == 'MESH']
+
+if not mesh_objects:
+    print("⚠ No mesh objects found")
+else:
+    print(f"Processing {len(mesh_objects)} mesh object(s)...")
+    
+    for obj in mesh_objects:
+        print(f"\\n{obj.name}:")
+        
+        # Store current scale and dimensions
+        current_dimensions = obj.dimensions.copy()
+        max_dim = max(current_dimensions)
+        
+        print(f"  Current dimensions: {[round(d, 3) for d in current_dimensions]}")
+        print(f"  Max dimension: {round(max_dim, 3)}")
+        
+        # Set origin to geometry center
+        bpy.context.view_layer.objects.active = obj
+        obj.select_set(True)
+        bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
+        print("  ✓ Origin centered (scale preserved)")
+        
+        # Verify dimensions unchanged
+        new_dimensions = obj.dimensions.copy()
+        print(f"  Verified dimensions: {[round(d, 3) for d in new_dimensions]}")
+        
+        obj.select_set(False)
+    
+    print(f"\\n✓ Processed {len(mesh_objects)} object(s) - custom sizes preserved")
 
 print("=" * 60)
 `;
@@ -513,12 +656,52 @@ ${generateQualityScore()}
 `;
 }
 
+/**
+ * Generate comprehensive quality improvement pipeline (preserves colors)
+ */
+function generateQualityPipelinePreserveColors() {
+  return `
+${generateGeometryCleanup()}
+
+${generatePBRMaterialEnhancementPreserveColors()}
+
+${generateUVConsistencyFix()}
+
+${generateAutoScaleAndOriginFix()}
+
+${generateQualityScore()}
+`;
+}
+
+/**
+ * Generate selective quality pipeline preserving both colors AND custom scales
+ * Only fixes: cleanup geometry, UV consistency, origin centering
+ * Skips: auto-scaling (preserves user-set sizes)
+ */
+function generateQualityPipelinePreserveColorsAndScale() {
+  return `
+${generateGeometryCleanup()}
+
+${generatePBRMaterialEnhancementPreserveColors()}
+
+${generateUVConsistencyFix()}
+
+${generateOriginFixPreserveScale()}
+
+${generateQualityScore()}
+`;
+}
+
 module.exports = {
   generateGeometryCleanup,
   generatePBRMaterialEnhancement,
+  generatePBRMaterialEnhancementPreserveColors,
   generateUVConsistencyFix,
   generateAutoScaleAndOriginFix,
+  generateOriginFixPreserveScale,
   generateQualityScore,
   generateQualityPipeline,
+  generateQualityPipelinePreserveColors,
+  generateQualityPipelinePreserveColorsAndScale,
   validateGLBOutput
 };

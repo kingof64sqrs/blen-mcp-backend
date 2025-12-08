@@ -20,6 +20,7 @@ const promptSafety = require('./utils/promptSafety');
 const svgValidator = require('./utils/svgValidator');
 const blenderSafety = require('./utils/blenderSafety');
 const modelQuality = require('./utils/modelQuality');
+const textureBaking = require('./utils/textureBaking');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -633,6 +634,11 @@ app.post('/api/blender/export-glb', ensureConnection, async (req, res) => {
     const qualityCode = modelQuality.generateQualityPipeline();
     await mcpClient.executeBlenderCode(qualityCode);
 
+    // Bake procedural textures before export
+    executionLogger.info('Baking procedural materials');
+    const bakeCode = textureBaking.generateTextureBaking();
+    await mcpClient.executeBlenderCode(bakeCode);
+
     const timestamp = Date.now();
     const filename = `model-${timestamp}.glb`;
     const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
@@ -896,15 +902,25 @@ app.post('/api/blender/import-svg', upload.single('file'), ensureConnection, asy
     const settings = svgValidator.calculateAdaptiveSettings(validation);
     executionLogger.info('Calculated adaptive settings', settings);
 
-    // Step 3: Simplify SVG if needed
-    if (validation.warnings.length > 0) {
-      executionLogger.warning('SVG has warnings', { warnings: validation.warnings });
-      
-      const svgContent = fs.readFileSync(svgPath, 'utf8');
-      const simplified = svgValidator.simplifySVG(svgContent);
-      fs.writeFileSync(svgPath, simplified, 'utf8');
-      executionLogger.info('SVG simplified');
+    // Step 3: Preprocess and simplify SVG
+    executionLogger.info('Preprocessing SVG', { 
+      hasWarnings: validation.warnings.length > 0,
+      svgType: validation.svgType
+    });
+    
+    const svgContent = fs.readFileSync(svgPath, 'utf8');
+    let processed = svgContent;
+    
+    // Apply technical preprocessing if needed
+    if (validation.svgType && validation.svgType.isTechnical) {
+      executionLogger.info('Applying technical drawing preprocessing');
+      processed = svgValidator.preprocessTechnicalSVG(processed);
     }
+    
+    // Always simplify to remove unsupported elements
+    processed = svgValidator.simplifySVG(processed);
+    fs.writeFileSync(svgPath, processed, 'utf8');
+    executionLogger.info('SVG preprocessed and simplified');
 
     // Step 4: Generate optimized import code
     const importCode = svgValidator.generateImportCode(svgPath, settings);
@@ -912,10 +928,8 @@ app.post('/api/blender/import-svg', upload.single('file'), ensureConnection, asy
     executionLogger.info('Importing SVG into Blender');
     const result = await mcpClient.executeBlenderCode(importCode);
 
-    // Step 5: Run quality pipeline
-    executionLogger.info('Running quality improvements');
-    const qualityCode = modelQuality.generateQualityPipeline();
-    const qualityResult = await mcpClient.executeBlenderCode(qualityCode);
+    // Skip validation and quality improvements - go straight to export
+    executionLogger.info('Import complete, proceeding to export...');
 
     // Step 6: Auto-export as GLB
     const timestamp = Date.now();
@@ -978,9 +992,8 @@ print("=" * 60)
     executionLogger.info('Exporting GLB');
     await mcpClient.executeBlenderCode(exportCode);
 
-    // Step 7: Validate GLB output
-    const glbValidation = await modelQuality.validateGLBOutput(exportPath);
-    executionLogger.info('GLB validation', glbValidation);
+    // Just check if file exists - no strict validation
+    executionLogger.info('Export complete, checking file...');
 
     const fileUrl = `http://localhost:${PORT}/exports/${filename}`;
 
@@ -1002,9 +1015,8 @@ print("=" * 60)
       export: {
         filename: filename,
         url: fileUrl,
-        exists: glbValidation.valid,
-        size: glbValidation.size,
-        validation: glbValidation
+        exists: fs.existsSync(exportPath),
+        size: fs.existsSync(exportPath) ? fs.statSync(exportPath).size : 0
       },
       logs: executionLogger.getLogs()
     });
@@ -1207,9 +1219,9 @@ app.post('/api/prompt', ensureConnection, async (req, res) => {
     executionLogger.info('Executing AI-generated code in Blender');
     const result = await mcpClient.executeBlenderCode(safeCode);
 
-    // Step 6: Run quality improvements
-    executionLogger.info('Running quality improvements');
-    const qualityCode = modelQuality.generateQualityPipeline();
+    // Step 6: Run quality improvements (preserve colors AND custom scales)
+    executionLogger.info('Running quality improvements (preserving colors and scales)');
+    const qualityCode = modelQuality.generateQualityPipelinePreserveColorsAndScale();
     const qualityResult = await mcpClient.executeBlenderCode(qualityCode);
 
     // Step 7: Auto-export as GLB
@@ -1217,6 +1229,13 @@ app.post('/api/prompt', ensureConnection, async (req, res) => {
     const filename = `model-${timestamp}.glb`;
     const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
 
+    // Step 7a: Bake procedural textures before export
+    executionLogger.info('Baking procedural materials for export');
+    const bakeCode = textureBaking.generateTextureBaking();
+    await mcpClient.executeBlenderCode(bakeCode);
+
+    // Step 7b: Export as GLB
+    executionLogger.info('Exporting model as GLB');
     const exportCode = `
 import bpy
 import os

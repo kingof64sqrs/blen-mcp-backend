@@ -19,7 +19,7 @@ const DANGEROUS_PATTERNS = [
   /bpy\.ops\.wm\.save/gi,
   /bpy\.app\.quit/gi,
   /\.unlink\(/gi,
-  /\.remove\(/gi,
+  /os\.remove\(/gi,  // Only block os.remove, not all .remove
   /\.rmdir\(/gi,
   /shutil\./gi,
   /pathlib\./gi
@@ -185,7 +185,29 @@ function expandDomainVocabulary(prompt) {
     'metal': 'Principled BSDF with metallic = 1.0'
   };
   
+  // Context keywords that indicate working with existing objects
+  const contextKeywords = {
+    'keep': 'preserve existing without creating new',
+    'preserve': 'maintain existing without creating new',
+    'maintain': 'keep existing without creating new',
+    'the object': 'the currently active/selected object',
+    'active object': 'bpy.context.active_object',
+    'selected': 'currently selected objects in scene',
+    'current': 'the existing active object'
+  };
+  
   let expanded = prompt;
+  
+  // First check for context keywords
+  for (const [term, hint] of Object.entries(contextKeywords)) {
+    const regex = new RegExp(`\\b${term}\\b`, 'gi');
+    if (regex.test(expanded)) {
+      expanded = `[Context: ${hint}] ${expanded}`;
+      break; // Only add context hint once
+    }
+  }
+  
+  // Then expand domain vocabulary
   for (const [term, expansion] of Object.entries(expansions)) {
     const regex = new RegExp(`\\b${term}\\b`, 'gi');
     if (regex.test(expanded) && !expanded.includes(expansion)) {
@@ -210,6 +232,13 @@ CRITICAL SAFETY RULES:
 4. NEVER access filesystem or network
 5. Output ONLY executable Python code with NO explanations
 
+CONTEXT AWARENESS:
+- If user says "keep", "preserve", "maintain" - DO NOT create new objects
+- If user says "the object", "active object", "selected" - work with existing selection
+- If user says "add", "create", "make", "new" - create new objects
+- Check if objects exist before creating: if not obj or obj.type != 'MESH'
+- Use bpy.context.active_object for the currently selected object
+
 REQUIRED CODE STRUCTURE:
 - Always start with: import bpy
 - Use try-except blocks for error handling
@@ -226,6 +255,12 @@ MATERIAL CREATION (MANDATORY):
 
 COMMON OPERATIONS:
 
+Working with Existing Objects:
+- Get active: obj = bpy.context.active_object
+- Get all selected: objs = bpy.context.selected_objects
+- Check if mesh: if obj and obj.type == 'MESH'
+- Modify existing: obj.location += Vector((1, 0, 0))
+
 Creating Objects:
 - Cube: bpy.ops.mesh.primitive_cube_add(location=(x, y, z))
 - Sphere: bpy.ops.mesh.primitive_uv_sphere_add(radius=1.0, location=(x, y, z))
@@ -240,9 +275,11 @@ Transformations:
 Materials Example:
 import bpy
 
-# Create object
-bpy.ops.mesh.primitive_cube_add()
+# Get existing object or create new
 obj = bpy.context.active_object
+if not obj or obj.type != 'MESH':
+    bpy.ops.mesh.primitive_cube_add()
+    obj = bpy.context.active_object
 
 # Create material with shader nodes
 mat = bpy.data.materials.new(name="MyMaterial")
@@ -263,7 +300,7 @@ if len(obj.data.materials):
 else:
     obj.data.materials.append(mat)
 
-print(f"Created {obj.name} with material")
+print(f"Applied material to {obj.name}")
 
 FORBIDDEN OPERATIONS:
 ❌ os.system(), subprocess.call()

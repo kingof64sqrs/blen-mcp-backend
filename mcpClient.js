@@ -160,7 +160,7 @@ class MCPClient extends EventEmitter {
           this.pendingRequests.delete(id);
           reject(new Error(`Request timeout: ${method}`));
         }
-      }, 60000); // 60 second timeout
+      }, 180000); // 180 second timeout (3 minutes) for complex operations
 
       this.pendingRequests.set(id, { resolve, reject, timer });
 
