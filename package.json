@@ -1,7 +1,7 @@
 {
   "name": "blender-mcp-server",
-  "version": "1.0.0",
-  "description": "HTTP API server for Blender MCP integration",
+  "version": "2.0.0",
+  "description": "Enhanced HTTP API server for Blender MCP integration with advanced safety, quality, and validation features",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

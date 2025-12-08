@@ -15,6 +15,12 @@ const Token = require('./models/Token');
 const { generateAccessToken, generateRefreshToken } = require('./utils/jwt');
 const { initEmailService, sendOTPEmail } = require('./services/emailService');
 
+// Import safety and quality modules
+const promptSafety = require('./utils/promptSafety');
+const svgValidator = require('./utils/svgValidator');
+const blenderSafety = require('./utils/blenderSafety');
+const modelQuality = require('./utils/modelQuality');
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -63,6 +69,9 @@ app.use('/views', express.static(path.join(__dirname, 'views'))); // Serve HTML 
 // Initialize MCP Client
 const mcpClient = new MCPClient();
 let isInitializing = false;
+
+// Initialize execution logger
+const executionLogger = new blenderSafety.ExecutionLogger();
 
 // Ensure MCP connection before handling requests
 async function ensureConnection(req, res, next) {
@@ -525,7 +534,7 @@ app.get('/api/status', ensureConnection, async (req, res) => {
 
 /**
  * POST /api/blender/execute
- * Execute Python code in Blender
+ * Execute Python code in Blender with safety validation
  * Body: { code: "import bpy\nbpy.ops.mesh.primitive_cube_add()" }
  */
 app.post('/api/blender/execute', ensureConnection, async (req, res) => {
@@ -539,12 +548,37 @@ app.post('/api/blender/execute', ensureConnection, async (req, res) => {
       });
     }
 
-    const result = await mcpClient.executeBlenderCode(code);
+    // Validate code safety
+    const validation = promptSafety.validateGeneratedCode(code);
+    
+    if (!validation.safe) {
+      executionLogger.error('Code validation failed', new Error('Unsafe code detected'));
+      return res.status(400).json({
+        success: false,
+        error: 'Code validation failed: Unsafe operations detected',
+        issues: validation.issues
+      });
+    }
+
+    // Wrap in safe execution context
+    const safeCode = blenderSafety.wrapInSafeContext(code, 'Direct Code Execution');
+
+    executionLogger.info('Executing code', { codeLength: code.length, warnings: validation.warningCount });
+
+    const result = await mcpClient.executeBlenderCode(safeCode);
+    
+    executionLogger.success('Code executed successfully');
+
     res.json({
       success: true,
-      data: result
+      data: result,
+      validation: {
+        warnings: validation.warningCount,
+        issues: validation.issues.filter(i => i.severity === 'warning')
+      }
     });
   } catch (error) {
+    executionLogger.error('Execution failed', error);
     res.status(500).json({
       success: false,
       error: error.message
@@ -588,84 +622,149 @@ app.get('/api/blender/screenshot', ensureConnection, async (req, res) => {
 
 /**
  * POST /api/blender/export-glb
- * Export current Blender scene as GLB file
+ * Export current Blender scene as GLB file with quality checks
  * Returns URL to download the exported GLB
  */
 app.post('/api/blender/export-glb', ensureConnection, async (req, res) => {
   try {
+    executionLogger.info('Starting GLB export');
+
+    // Run quality improvements before export
+    const qualityCode = modelQuality.generateQualityPipeline();
+    await mcpClient.executeBlenderCode(qualityCode);
+
     const timestamp = Date.now();
     const filename = `model-${timestamp}.glb`;
     const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
 
-    // Python code to export scene as GLB
+    // Enhanced export code with validation
     const exportCode = `
 import bpy
 import os
+
+print("\\n" + "=" * 60)
+print("EXPORTING CURRENT SCENE AS GLB")
+print("=" * 60)
 
 # Enable GLTF exporter addon if not already enabled
 if 'io_scene_gltf2' not in bpy.context.preferences.addons:
     try:
         bpy.ops.preferences.addon_enable(module='io_scene_gltf2')
-        print("GLTF exporter addon enabled")
+        print("✓ GLTF exporter addon enabled")
     except Exception as e:
-        print(f"Warning: Could not enable GLTF exporter: {str(e)}")
+        print(f"⚠ Warning: Could not enable GLTF exporter: {str(e)}")
 
 export_path = r"${exportPath}"
-print(f"Exporting to: {export_path}")
+print(f"\\nExport path: {export_path}")
 
 # Make sure export directory exists
 os.makedirs(os.path.dirname(export_path), exist_ok=True)
 
 # Convert all materials to use shader nodes for proper export
+print("\\nVerifying material shader nodes...")
+materials_fixed = 0
 for mat in bpy.data.materials:
     if mat and not mat.use_nodes:
-        print(f"Converting material '{mat.name}' to use nodes")
+        print(f"⚠ Converting material '{mat.name}' to use nodes")
         mat.use_nodes = True
         nodes = mat.node_tree.nodes
         bsdf = nodes.get('Principled BSDF')
         if bsdf:
-            # Copy viewport color to shader node
             bsdf.inputs['Base Color'].default_value = mat.diffuse_color
-            print(f"Set Base Color to {mat.diffuse_color[:]}")
+            print(f"  Set Base Color to {mat.diffuse_color[:]}")
+            materials_fixed += 1
+    else:
+        if mat:
+            print(f"✓ Material '{mat.name}' already uses shader nodes")
+
+if materials_fixed > 0:
+    print(f"✓ Fixed {materials_fixed} material(s)")
 
 # Select all mesh objects
 bpy.ops.object.select_all(action='DESELECT')
+mesh_objects = []
 for obj in bpy.data.objects:
     if obj.type == 'MESH':
         obj.select_set(True)
+        mesh_objects.append(obj)
 
-if not bpy.context.selected_objects:
-    print("Warning: No mesh objects to export")
+if not mesh_objects:
+    print("\\n✗ Warning: No mesh objects to export")
 else:
+    print(f"\\n✓ Selected {len(mesh_objects)} mesh object(s) for export")
+    for obj in mesh_objects:
+        print(f"  - {obj.name}: {len(obj.data.vertices):,} verts, {len(obj.data.materials)} material(s)")
+    
     # Export selected objects as GLB
-    bpy.ops.export_scene.gltf(
-        filepath=export_path,
-        export_format='GLB',
-        use_selection=True,
-        export_apply=True,
-        export_materials='EXPORT'
-    )
-    print(f"Successfully exported {len(bpy.context.selected_objects)} objects to GLB")
+    print("\\nExporting GLB...")
+    try:
+        bpy.ops.export_scene.gltf(
+            filepath=export_path,
+            export_format='GLB',
+            use_selection=True,
+            export_apply=True,
+            export_materials='EXPORT',
+            export_texcoords=True,
+            export_normals=True,
+            export_tangents=True,
+            export_yup=True
+        )
+        
+        if os.path.exists(export_path):
+            file_size = os.path.getsize(export_path)
+            print(f"\\n✓ SUCCESS: Exported {len(mesh_objects)} objects")
+            print(f"  - Size: {file_size:,} bytes ({file_size / 1024:.2f} KB)")
+            print("=" * 60)
+        else:
+            print(f"\\n✗ ERROR: Export completed but file not found")
+            raise Exception("Export file not created")
+    except Exception as e:
+        print(f"\\n✗ ERROR during export: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+print("=" * 60)
 `;
 
     await mcpClient.executeBlenderCode(exportCode);
 
+    // Validate GLB output
+    const glbValidation = await modelQuality.validateGLBOutput(exportPath);
+    
+    if (!glbValidation.valid) {
+      executionLogger.error('GLB validation failed', new Error(glbValidation.error));
+      return res.status(500).json({
+        success: false,
+        error: 'GLB export validation failed',
+        validation: glbValidation
+      });
+    }
+
     // Return URL to access the exported file
     const fileUrl = `http://localhost:${PORT}/exports/${filename}`;
+
+    executionLogger.success('GLB export completed', glbValidation);
 
     res.json({
       success: true,
       message: 'Scene exported successfully',
       filename: filename,
       url: fileUrl,
-      path: exportPath
+      path: exportPath,
+      validation: glbValidation,
+      logs: executionLogger.getLogs()
     });
   } catch (error) {
+    executionLogger.error('GLB export failed', error);
     console.error('GLB export error:', error);
     res.status(500).json({
       success: false,
-      error: error.message
+      error: error.message,
+      logs: executionLogger.getLogs()
     });
+  } finally {
+    executionLogger.clear();
   }
 });
 
@@ -760,7 +859,7 @@ except Exception as e:
 
 /**
  * POST /api/blender/import-svg
- * Upload and import SVG file into Blender
+ * Upload and import SVG file into Blender with validation and optimization
  * Multipart form data with 'file' field
  */
 app.post('/api/blender/import-svg', upload.single('file'), ensureConnection, async (req, res) => {
@@ -774,154 +873,51 @@ app.post('/api/blender/import-svg', upload.single('file'), ensureConnection, asy
 
     const svgPath = req.file.path.replace(/\\/g, '/'); // Normalize path for Blender
 
-    // Python code to import SVG in Blender
-    const importCode = `
-import bpy
-import os
+    // Step 1: Validate SVG
+    executionLogger.info('Validating SVG', { filename: req.file.originalname });
+    const validation = await svgValidator.validateSVG(svgPath);
 
-# Enable SVG import addon if not already enabled
-if 'io_curve_svg' not in bpy.context.preferences.addons:
-    try:
-        bpy.ops.preferences.addon_enable(module='io_curve_svg')
-        print("SVG import addon enabled")
-    except Exception as e:
-        print(f"Warning: Could not enable SVG import addon: {str(e)}")
+    if (!validation.valid) {
+      executionLogger.error('SVG validation failed', new Error(validation.issues.join(', ')));
+      
+      // Clean up uploaded file
+      if (fs.existsSync(svgPath)) {
+        fs.unlinkSync(svgPath);
+      }
+      
+      return res.status(400).json({
+        success: false,
+        error: 'SVG validation failed',
+        issues: validation.issues
+      });
+    }
 
-# Enable GLTF exporter addon if not already enabled
-if 'io_scene_gltf2' not in bpy.context.preferences.addons:
-    try:
-        bpy.ops.preferences.addon_enable(module='io_scene_gltf2')
-        print("GLTF exporter addon enabled")
-    except Exception as e:
-        print(f"Warning: Could not enable GLTF exporter: {str(e)}")
+    // Step 2: Calculate adaptive settings
+    const settings = svgValidator.calculateAdaptiveSettings(validation);
+    executionLogger.info('Calculated adaptive settings', settings);
 
-# Clear the entire scene first
-print("Clearing scene...")
-bpy.ops.object.select_all(action='SELECT')
-bpy.ops.object.delete()
-print("Scene cleared")
+    // Step 3: Simplify SVG if needed
+    if (validation.warnings.length > 0) {
+      executionLogger.warning('SVG has warnings', { warnings: validation.warnings });
+      
+      const svgContent = fs.readFileSync(svgPath, 'utf8');
+      const simplified = svgValidator.simplifySVG(svgContent);
+      fs.writeFileSync(svgPath, simplified, 'utf8');
+      executionLogger.info('SVG simplified');
+    }
 
-# Clear existing selection
-bpy.ops.object.select_all(action='DESELECT')
+    // Step 4: Generate optimized import code
+    const importCode = svgValidator.generateImportCode(svgPath, settings);
 
-# Import SVG
-svg_path = "${svgPath}"
-print(f"Attempting to import SVG from: {svg_path}")
-
-try:
-    # Store objects before import
-    objects_before = set(bpy.data.objects)
-    
-    bpy.ops.import_curve.svg(filepath=svg_path)
-    print(f"SVG import operation completed")
-    
-    # Find newly created objects
-    objects_after = set(bpy.data.objects)
-    imported_objects = list(objects_after - objects_before)
-    
-    # Also check selected objects as fallback
-    if not imported_objects:
-        imported_objects = list(bpy.context.selected_objects)
-    
-    print(f"Found {len(imported_objects)} imported objects")
-    
-except Exception as e:
-    print(f"Error importing SVG: {str(e)}")
-    raise
-
-if imported_objects:
-    # Store original colors from curve materials before conversion
-    curve_colors = {}
-    for obj in imported_objects:
-        if obj.type == 'CURVE' and obj.data.materials:
-            for mat in obj.data.materials:
-                if mat:
-                    # Store the material color (RGBA)
-                    curve_colors[obj.name] = mat.diffuse_color[:]
-                    print(f"Found color in {obj.name}: {mat.diffuse_color[:]}")
-                    break
-    
-    # Convert curves to mesh
-    for obj in imported_objects:
-        print(f"Processing object: {obj.name}, type: {obj.type}")
-        if obj.type == 'CURVE':
-            bpy.context.view_layer.objects.active = obj
-            obj.select_set(True)
-            # Add extrusion depth
-            obj.data.extrude = 0.1
-            obj.data.bevel_depth = 0.01
-            # Convert to mesh
-            bpy.ops.object.convert(target='MESH')
-    
-    # Join all imported objects
-    if len(imported_objects) > 1:
-        bpy.ops.object.select_all(action='DESELECT')
-        for obj in imported_objects:
-            obj.select_set(True)
-        bpy.context.view_layer.objects.active = imported_objects[0]
-        bpy.ops.object.join()
-    
-    # Get the final object
-    final_obj = bpy.context.active_object
-    if final_obj:
-        final_obj.name = "ImportedSVG"
-        # Center to world origin
-        bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center='BOUNDS')
-        final_obj.location = (0, 0, 0)
-        
-        # Apply the original SVG color to the mesh
-        if curve_colors:
-            # Use the first color found
-            svg_color = list(curve_colors.values())[0]
-            print(f"Applying SVG color: {svg_color}")
-            
-            # Create or update material with proper shader nodes
-            mat_name = "SVG_Material"
-            if mat_name in bpy.data.materials:
-                mat = bpy.data.materials[mat_name]
-            else:
-                mat = bpy.data.materials.new(name=mat_name)
-            
-            # Enable nodes
-            mat.use_nodes = True
-            nodes = mat.node_tree.nodes
-            nodes.clear()
-            
-            # Create Principled BSDF
-            bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
-            bsdf.location = (0, 0)
-            bsdf.inputs['Base Color'].default_value = svg_color
-            bsdf.inputs['Roughness'].default_value = 0.4
-            bsdf.inputs['Metallic'].default_value = 0.3
-            
-            # Create Material Output
-            output = nodes.new(type='ShaderNodeOutputMaterial')
-            output.location = (300, 0)
-            
-            # Link nodes
-            links = mat.node_tree.links
-            links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
-            
-            # Apply material to object
-            if final_obj.data.materials:
-                final_obj.data.materials[0] = mat
-            else:
-                final_obj.data.materials.append(mat)
-            
-            print(f"Material '{mat_name}' created and applied with color {svg_color}")
-        else:
-            print("Warning: No color information found in SVG, using default material")
-        
-        print(f"SVG imported successfully: {final_obj.name}")
-        print(f"Vertices: {len(final_obj.data.vertices)}")
-        print(f"Faces: {len(final_obj.data.polygons)}")
-else:
-    print("No objects imported from SVG - check if the SVG file contains valid curves")
-`;
-
+    executionLogger.info('Importing SVG into Blender');
     const result = await mcpClient.executeBlenderCode(importCode);
 
-    // Auto-export as GLB with better error handling
+    // Step 5: Run quality pipeline
+    executionLogger.info('Running quality improvements');
+    const qualityCode = modelQuality.generateQualityPipeline();
+    const qualityResult = await mcpClient.executeBlenderCode(qualityCode);
+
+    // Step 6: Auto-export as GLB
     const timestamp = Date.now();
     const filename = `svg-import-${timestamp}.glb`;
     const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
@@ -930,94 +926,99 @@ else:
 import bpy
 import os
 
+print("\\n" + "=" * 60)
+print("EXPORTING OPTIMIZED MODEL")
+print("=" * 60)
+
 export_path = r"${exportPath}"
-print(f"Export path: {export_path}")
+os.makedirs(os.path.dirname(export_path), exist_ok=True)
 
-# Ensure directory exists
-export_dir = os.path.dirname(export_path)
-os.makedirs(export_dir, exist_ok=True)
-print(f"Export directory: {export_dir}")
-
-# Convert all materials to use shader nodes for proper export
-for mat in bpy.data.materials:
-    if mat and not mat.use_nodes:
-        print(f"Converting material '{mat.name}' to use nodes")
-        mat.use_nodes = True
-        nodes = mat.node_tree.nodes
-        bsdf = nodes.get('Principled BSDF')
-        if bsdf:
-            # Copy viewport color to shader node
-            bsdf.inputs['Base Color'].default_value = mat.diffuse_color
-            print(f"Set Base Color to {mat.diffuse_color[:]}")
-
-# Select all mesh objects
-bpy.ops.object.select_all(action='DESELECT')
-mesh_count = 0
-for obj in bpy.data.objects:
-    if obj.type == 'MESH':
-        obj.select_set(True)
-        mesh_count += 1
-        print(f"Selected mesh: {obj.name}")
-
-print(f"Total meshes selected: {mesh_count}")
-
-if mesh_count == 0:
-    print("ERROR: No mesh objects found to export!")
-else:
+# Ensure GLTF exporter
+if 'io_scene_gltf2' not in bpy.context.preferences.addons:
     try:
-        # Export as GLB
+        bpy.ops.preferences.addon_enable(module='io_scene_gltf2')
+    except: pass
+
+# Select mesh objects
+bpy.ops.object.select_all(action='DESELECT')
+mesh_objects = [obj for obj in bpy.data.objects if obj.type == 'MESH']
+
+for obj in mesh_objects:
+    obj.select_set(True)
+
+if mesh_objects:
+    try:
         bpy.ops.export_scene.gltf(
             filepath=export_path,
             export_format='GLB',
             use_selection=True,
             export_apply=True,
-            export_materials='EXPORT'
+            export_materials='EXPORT',
+            export_texcoords=True,
+            export_normals=True,
+            export_tangents=True,
+            export_yup=True
         )
         
-        # Verify file was created
         if os.path.exists(export_path):
             file_size = os.path.getsize(export_path)
-            print(f"SUCCESS: Exported {mesh_count} objects to {export_path} (size: {file_size} bytes)")
+            print(f"✓ Exported: {file_size:,} bytes ({file_size/1024:.2f} KB)")
         else:
-            print(f"ERROR: Export completed but file not found at {export_path}")
+            print("✗ Export file not created")
     except Exception as e:
-        print(f"ERROR during export: {str(e)}")
+        print(f"✗ Export error: {e}")
         import traceback
         traceback.print_exc()
+else:
+    print("✗ No mesh objects to export")
+
+print("=" * 60)
 `;
 
-    const exportResult = await mcpClient.executeBlenderCode(exportCode);
-    console.log('Export result:', exportResult);
+    executionLogger.info('Exporting GLB');
+    await mcpClient.executeBlenderCode(exportCode);
 
-    // Check if file actually exists
-    const fileExists = fs.existsSync(exportPath);
-    console.log('File exists:', fileExists, 'at', exportPath);
+    // Step 7: Validate GLB output
+    const glbValidation = await modelQuality.validateGLBOutput(exportPath);
+    executionLogger.info('GLB validation', glbValidation);
 
     const fileUrl = `http://localhost:${PORT}/exports/${filename}`;
 
+    executionLogger.success('SVG import pipeline completed');
+
     res.json({
       success: true,
-      message: 'SVG imported into Blender successfully',
+      message: 'SVG imported and optimized successfully',
       file: {
         name: req.file.originalname,
-        path: svgPath,
-        size: req.file.size
+        size: req.file.size,
+        path: svgPath
       },
-      result: result,
+      validation: {
+        stats: validation.stats,
+        warnings: validation.warnings
+      },
+      settings: settings,
       export: {
         filename: filename,
         url: fileUrl,
-        exists: fileExists,
-        path: exportPath
+        exists: glbValidation.valid,
+        size: glbValidation.size,
+        validation: glbValidation
       },
-      exportResult: exportResult
+      logs: executionLogger.getLogs()
     });
   } catch (error) {
+    executionLogger.error('SVG import failed', error);
     console.error('SVG import error:', error);
     res.status(500).json({
       success: false,
-      error: error.message
+      error: error.message,
+      logs: executionLogger.getLogs()
     });
+  } finally {
+    // Clear logger for next operation
+    executionLogger.clear();
   }
 });
 
@@ -1119,7 +1120,7 @@ app.post('/api/sketchfab/download', ensureConnection, async (req, res) => {
 
 /**
  * POST /api/prompt
- * Execute natural language prompt in Blender
+ * Execute natural language prompt in Blender with enhanced AI safety
  * Body: { prompt: "create a red cube at position 0,0,0" }
  */
 app.post('/api/prompt', ensureConnection, async (req, res) => {
@@ -1133,63 +1134,39 @@ app.post('/api/prompt', ensureConnection, async (req, res) => {
       });
     }
 
-    // Use Azure OpenAI to convert prompt to Blender Python code
-    const systemPrompt = `You are a Blender Python code generator. Convert user prompts into executable Blender Python code.
-Rules:
-- Only output Python code, no explanations
-- Always import bpy at the start
-- Use proper Blender API syntax with shader nodes for materials
-- Handle common operations: creating objects, materials, animations, modifiers
-- For positions, use location parameter in tuples
-- For colors, ALWAYS use shader nodes (Principled BSDF) with RGBA values (0-1 range)
-- NEVER use diffuse_color alone - always set up proper shader nodes
-- Add print statements to confirm actions
+    executionLogger.info('Processing prompt', { prompt });
 
-Examples:
-User: "create a red cube"
-Code: import bpy
-bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0))
-obj = bpy.context.active_object
-mat = bpy.data.materials.new(name='Red')
-mat.use_nodes = True
-nodes = mat.node_tree.nodes
-bsdf = nodes.get('Principled BSDF')
-if bsdf:
-    bsdf.inputs['Base Color'].default_value = (1, 0, 0, 1)
-obj.data.materials.append(mat)
-print('Red cube created')
+    // Step 1: Process and validate prompt
+    const promptProcessing = promptSafety.processPrompt(prompt);
+    
+    if (!promptProcessing.valid) {
+      executionLogger.error('Prompt validation failed', new Error(promptProcessing.error));
+      return res.status(400).json({
+        success: false,
+        error: promptProcessing.error,
+        stage: promptProcessing.stage
+      });
+    }
 
-User: "change color to blue"
-Code: import bpy
-obj = bpy.context.active_object
-if obj and obj.type == 'MESH':
-    if not obj.data.materials:
-        mat = bpy.data.materials.new(name='Blue')
-        mat.use_nodes = True
-        obj.data.materials.append(mat)
-    else:
-        mat = obj.data.materials[0]
-        mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    bsdf = nodes.get('Principled BSDF')
-    if bsdf:
-        bsdf.inputs['Base Color'].default_value = (0, 0, 1, 1)
-    print('Changed color to blue')
+    executionLogger.info('Prompt validated', {
+      original: promptProcessing.originalPrompt,
+      cleaned: promptProcessing.cleanedPrompt,
+      expanded: promptProcessing.expandedPrompt
+    });
 
-User: "add a light above"
-Code: import bpy
-bpy.ops.object.light_add(type='POINT', location=(0, 0, 5))
-print('Light added')`;
-
+    // Step 2: Use Azure OpenAI to generate code with enhanced system prompt
     const response = await axios.post(
       `${process.env.AZURE_OPENAI_ENDPOINT}/openai/deployments/${process.env.AZURE_OPENAI_MODEL}/chat/completions?api-version=${process.env.AZURE_OPENAI_API_VERSION}`,
       {
         messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: prompt }
+          { role: 'system', content: promptProcessing.systemPrompt },
+          { role: 'user', content: promptProcessing.expandedPrompt }
         ],
         temperature: 0.3,
-        max_tokens: 500
+        max_tokens: 800,
+        top_p: 0.95,
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0
       },
       {
         headers: {
@@ -1199,12 +1176,43 @@ print('Light added')`;
       }
     );
 
-    const generatedCode = response.data.choices[0].message.content.trim();
+    let generatedCode = response.data.choices[0].message.content.trim();
+    
+    // Remove markdown code blocks if present
+    generatedCode = generatedCode.replace(/```python\n/g, '').replace(/```\n/g, '').replace(/```/g, '');
 
-    // Execute the generated code in Blender
-    const result = await mcpClient.executeBlenderCode(generatedCode);
+    executionLogger.info('AI code generated', { codeLength: generatedCode.length });
 
-    // Auto-export as GLB with better error handling
+    // Step 3: Validate generated code for safety
+    const codeValidation = promptSafety.validateGeneratedCode(generatedCode);
+    
+    if (!codeValidation.safe) {
+      executionLogger.error('Generated code validation failed', new Error('Unsafe operations detected'));
+      return res.status(400).json({
+        success: false,
+        error: 'Generated code contains unsafe operations',
+        issues: codeValidation.issues,
+        generatedCode: generatedCode
+      });
+    }
+
+    if (codeValidation.warningCount > 0) {
+      executionLogger.warning('Code has warnings', { warnings: codeValidation.issues });
+    }
+
+    // Step 4: Wrap in safe execution context
+    const safeCode = blenderSafety.wrapInSafeContext(generatedCode, 'AI Generated Code');
+
+    // Step 5: Execute in Blender
+    executionLogger.info('Executing AI-generated code in Blender');
+    const result = await mcpClient.executeBlenderCode(safeCode);
+
+    // Step 6: Run quality improvements
+    executionLogger.info('Running quality improvements');
+    const qualityCode = modelQuality.generateQualityPipeline();
+    const qualityResult = await mcpClient.executeBlenderCode(qualityCode);
+
+    // Step 7: Auto-export as GLB
     const timestamp = Date.now();
     const filename = `model-${timestamp}.glb`;
     const exportPath = path.join(exportsDir, filename).replace(/\\/g, '/');
@@ -1213,81 +1221,100 @@ print('Light added')`;
 import bpy
 import os
 
-# Enable GLTF exporter addon if not already enabled
+print("\\n" + "=" * 60)
+print("AUTO-EXPORT AFTER AI GENERATION")
+print("=" * 60)
+
 if 'io_scene_gltf2' not in bpy.context.preferences.addons:
     try:
         bpy.ops.preferences.addon_enable(module='io_scene_gltf2')
-        print("GLTF exporter addon enabled")
-    except Exception as e:
-        print(f"Warning: Could not enable GLTF exporter: {str(e)}")
+    except: pass
 
 export_path = r"${exportPath}"
-print(f"Export path: {export_path}")
+os.makedirs(os.path.dirname(export_path), exist_ok=True)
 
-# Ensure directory exists
-export_dir = os.path.dirname(export_path)
-os.makedirs(export_dir, exist_ok=True)
-
-# Convert all materials to use shader nodes for proper export
+# Verify materials have shader nodes
 for mat in bpy.data.materials:
     if mat and not mat.use_nodes:
-        print(f"Converting material '{mat.name}' to use nodes")
         mat.use_nodes = True
-        nodes = mat.node_tree.nodes
-        bsdf = nodes.get('Principled BSDF')
+        bsdf = mat.node_tree.nodes.get('Principled BSDF')
         if bsdf:
-            # Copy viewport color to shader node
             bsdf.inputs['Base Color'].default_value = mat.diffuse_color
-            print(f"Set Base Color to {mat.diffuse_color[:]}")
 
-# Select all mesh objects
+# Select mesh objects
 bpy.ops.object.select_all(action='DESELECT')
-mesh_count = 0
-for obj in bpy.data.objects:
-    if obj.type == 'MESH':
-        obj.select_set(True)
-        mesh_count += 1
+mesh_objects = [obj for obj in bpy.data.objects if obj.type == 'MESH']
 
-print(f"Total meshes selected: {mesh_count}")
+for obj in mesh_objects:
+    obj.select_set(True)
 
-if mesh_count > 0:
+if mesh_objects:
     try:
         bpy.ops.export_scene.gltf(
             filepath=export_path,
             export_format='GLB',
             use_selection=True,
             export_apply=True,
-            export_materials='EXPORT'
+            export_materials='EXPORT',
+            export_texcoords=True,
+            export_normals=True,
+            export_tangents=True,
+            export_yup=True
         )
         if os.path.exists(export_path):
-            print(f"SUCCESS: Exported {mesh_count} objects ({os.path.getsize(export_path)} bytes)")
-        else:
-            print(f"ERROR: Export completed but file not found")
+            file_size = os.path.getsize(export_path)
+            print(f"✓ Exported: {file_size:,} bytes")
     except Exception as e:
-        print(f"ERROR during export: {str(e)}")
+        print(f"✗ Export error: {e}")
+
+print("=" * 60)
 `;
 
-    const exportResult = await mcpClient.executeBlenderCode(exportCode);
-    const fileExists = fs.existsSync(exportPath);
+    executionLogger.info('Exporting model');
+    await mcpClient.executeBlenderCode(exportCode);
+
+    // Step 8: Validate GLB
+    const glbValidation = await modelQuality.validateGLBOutput(exportPath);
+    
     const fileUrl = `http://localhost:${PORT}/exports/${filename}`;
+
+    executionLogger.success('Prompt execution completed successfully');
 
     res.json({
       success: true,
-      prompt: prompt,
+      prompt: {
+        original: promptProcessing.originalPrompt,
+        cleaned: promptProcessing.cleanedPrompt,
+        expanded: promptProcessing.expandedPrompt
+      },
       generatedCode: generatedCode,
-      result: result,
+      codeValidation: {
+        safe: codeValidation.safe,
+        warnings: codeValidation.warningCount,
+        issues: codeValidation.issues.filter(i => i.severity === 'warning')
+      },
+      execution: {
+        result: result,
+        quality: qualityResult
+      },
       export: {
         filename: filename,
         url: fileUrl,
-        exists: fileExists
-      }
+        exists: glbValidation.valid,
+        validation: glbValidation
+      },
+      logs: executionLogger.getLogs()
     });
   } catch (error) {
+    executionLogger.error('Prompt execution failed', error);
     console.error('Prompt execution error:', error.message);
     res.status(500).json({
       success: false,
-      error: error.message
+      error: error.message,
+      logs: executionLogger.getLogs()
     });
+  } finally {
+    executionLogger.clear();
   }
 });
 
