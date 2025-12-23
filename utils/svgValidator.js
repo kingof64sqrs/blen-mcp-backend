@@ -355,7 +355,7 @@ function calculateAdaptiveSettings(validationResult) {
   const maxPathPoints = stats.maxPathPoints || 0;
   
   let settings = {
-    extrudeDepth: 0.1,
+    extrudeDepth: 0.025,
     bevelDepth: 0.01,
     curveResolution: 12,
     simplify: false,
@@ -373,7 +373,7 @@ function calculateAdaptiveSettings(validationResult) {
     settings.highPrecision = true;
     settings.curveResolution = 16;  // Reduced from 24 for performance
     settings.simplify = false;
-    settings.extrudeDepth = 0.05;
+    settings.extrudeDepth = 0.0125;
     settings.bevelDepth = 0.005;
     settings.preserveLayers = false;  // Disabled to prevent hanging
     settings.batchSize = 30;
@@ -384,7 +384,7 @@ function calculateAdaptiveSettings(validationResult) {
     settings.simplify = true;
     settings.simplifyThreshold = 0.005;
     settings.separateByColor = false;  // Disabled to prevent hanging
-    settings.extrudeDepth = 0.08;
+    settings.extrudeDepth = 0.02;
     settings.batchSize = 40;
   }
   // Layer-based illustrations
@@ -392,7 +392,7 @@ function calculateAdaptiveSettings(validationResult) {
     settings.preserveLayers = false;  // Disabled to prevent hanging
     settings.curveResolution = 12;
     settings.separateByColor = false;
-    settings.extrudeDepth = 0.1;
+    settings.extrudeDepth = 0.025;
     settings.batchSize = 40;
   }
   // Standard complexity adjustments
@@ -443,7 +443,7 @@ function calculateAdaptiveSettings(validationResult) {
 function generateImportCode(svgPath, settings) {
   // Settings are already calculated, just use them directly
   const curveResolution = settings.curveResolution || 12;
-  const extrusionDepth = settings.extrudeDepth || 0.1;
+  const extrusionDepth = settings.extrudeDepth || 0.025;
   
   return `
 import bpy
@@ -479,10 +479,12 @@ for data in curves_data:
     data['obj'].select_set(True)
 bpy.ops.object.convert(target='MESH')
 
-# Apply colors only
+# Apply colors and position above ground
+min_z = float('inf')
 for data in curves_data:
     obj = data['obj']
     if obj.type == 'MESH':
+        # Apply colors
         obj.data.materials.clear()
         mat = bpy.data.materials.new(name=f"{obj.name}_Mat")
         mat.use_nodes = True
@@ -490,6 +492,20 @@ for data in curves_data:
         if bsdf:
             bsdf.inputs[0].default_value = data['color']
         obj.data.materials.append(mat)
+        
+        # Find lowest Z point
+        if obj.data.vertices:
+            for v in obj.data.vertices:
+                world_co = obj.matrix_world @ v.co
+                if world_co.z < min_z:
+                    min_z = world_co.z
+
+# Move all objects up so lowest point is at Z=0
+if min_z < 0:
+    for data in curves_data:
+        obj = data['obj']
+        if obj.type == 'MESH':
+            obj.location.z -= min_z
 
 print("Import complete")
 `.trim();

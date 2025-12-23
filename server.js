@@ -686,28 +686,23 @@ for mat in bpy.data.materials:
 if materials_fixed > 0:
     print(f"✓ Fixed {materials_fixed} material(s)")
 
-# Select all mesh objects
-bpy.ops.object.select_all(action='DESELECT')
-mesh_objects = []
-for obj in bpy.data.objects:
-    if obj.type == 'MESH':
-        obj.select_set(True)
-        mesh_objects.append(obj)
+# Get all mesh objects
+mesh_objects = [obj for obj in bpy.data.objects if obj.type == 'MESH']
 
 if not mesh_objects:
     print("\\n✗ Warning: No mesh objects to export")
 else:
-    print(f"\\n✓ Selected {len(mesh_objects)} mesh object(s) for export")
+    print(f"\\n✓ Found {len(mesh_objects)} mesh object(s) for export")
     for obj in mesh_objects:
         print(f"  - {obj.name}: {len(obj.data.vertices):,} verts, {len(obj.data.materials)} material(s)")
     
-    # Export selected objects as GLB
+    # Export all mesh objects as GLB
     print("\\nExporting GLB...")
     try:
         bpy.ops.export_scene.gltf(
             filepath=export_path,
             export_format='GLB',
-            use_selection=True,
+            use_selection=False,
             export_apply=True,
             export_materials='EXPORT',
             export_texcoords=True,
@@ -808,8 +803,8 @@ app.post('/api/blender/test-export', ensureConnection, async (req, res) => {
 import bpy
 
 # Clear scene
-bpy.ops.object.select_all(action='SELECT')
-bpy.ops.object.delete()
+for obj in list(bpy.data.objects):
+    bpy.data.objects.remove(obj, do_unlink=True)
 
 # Create a cube
 bpy.ops.mesh.primitive_cube_add(location=(0, 0, 0))
@@ -823,14 +818,11 @@ export_path = r"${exportPath}"
 import os
 os.makedirs(os.path.dirname(export_path), exist_ok=True)
 
-bpy.ops.object.select_all(action='DESELECT')
-cube.select_set(True)
-
 try:
     bpy.ops.export_scene.gltf(
         filepath=export_path,
         export_format='GLB',
-        use_selection=True
+        use_selection=False
     )
     if os.path.exists(export_path):
         print(f"SUCCESS: Test export created at {export_path}")
